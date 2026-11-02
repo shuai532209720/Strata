@@ -130,12 +130,13 @@ irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | ie
 **Windows PowerShell, this fork (with the GPU lease: take turns on the card and the RAM with a local ComfyUI)**
 
 ```powershell
-irm https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/install-gpulease.ps1 | iex
+irm https://github.com/shuai532209720/Strata/releases/download/gpulease/install.ps1 | iex
 ```
 
 It starts from the official v0.2.9 Terminal (the one installed, or the official installer of v0.2.9 when there is none) and puts in
 only the server files this fork changed, each checked against its SHA-256. The official Terminal stays, and
-`$env:STRATA_GPULEASE_ROLLBACK='1'` before the same command switches back. Models, engines and configs already on the PC are not
+`$env:STRATA_GPULEASE_ROLLBACK='1'` before the same command switches back. The script is the asset of this fork's [gpulease release](https://github.com/shuai532209720/Strata/releases/tag/gpulease),
+the same file as `packaging/install-gpulease.ps1`. Models, engines and configs already on the PC are not
 touched. Run `strata launch --stop` first. How to turn the lease on: [GPU lease](docs/GPU_LEASE.md).
 
 On Windows, open a new terminal afterwards. Then:

@@ -28,7 +28,7 @@ v0.2.9 Terminal (Control 0.1.55, built from commit `c62d5e3a`, the commit these 
 
 ```powershell
 strata launch --stop
-irm https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/install-gpulease.ps1 | iex
+irm https://github.com/shuai532209720/Strata/releases/download/gpulease/install.ps1 | iex
 ```
 
 - It uses the official Terminal already installed, or installs it first with the official v0.2.9 installer (its signed feed and checksum).
@@ -37,6 +37,8 @@ irm https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/insta
   in, checks that it starts, and points `terminal\current` at it.
 - Models, engines, presets and run configs live outside the Terminal folder: nothing is downloaded again.
 - Back to the official Terminal: `$env:STRATA_GPULEASE_ROLLBACK='1'`, then the same `irm ... | iex`.
+- The script is the asset of the [gpulease release](https://github.com/shuai532209720/Strata/releases/tag/gpulease), the same file as
+  `packaging/install-gpulease.ps1` (also at `https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/install-gpulease.ps1`).
 - `strata update` to a later release replaces it; the lease then needs a new installer for that release.
 - From a file instead (no internet on that PC): `packaging/patch_release_terminal.py` builds the archive, `packaging/install-local.ps1`
   installs it.
