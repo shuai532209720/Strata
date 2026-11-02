@@ -123,6 +123,16 @@ curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.s
 irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
 ```
 
+**Windows PowerShell，本 fork（带 GPU 租约：和本机 ComfyUI 分时使用显卡和内存）**
+
+```powershell
+irm https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/install-gpulease.ps1 | iex
+```
+
+它以官方 v0.2.9 的 Terminal 为底（已装好就直接用，没有就先用官方安装程序装上），只换进本 fork 改过的服务端文件（逐个校验 SHA-256），
+旧的官方 Terminal 保留，可以随时切回：`$env:STRATA_GPULEASE_ROLLBACK='1'` 后再运行同一条命令。已经下载的模型、引擎和配置都不受影响。
+安装前先 `strata launch --stop`。租约怎么开、怎么用：[GPU 租约](docs/GPU_LEASE.md)。
+
 在 Windows 上，安装后请打开一个新的终端。然后运行：
 
 ```sh

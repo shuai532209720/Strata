@@ -21,6 +21,28 @@ leaves the model unloaded for good.
 This page is written from `serve/gpu_lease.py` and `serve/server.py`, and the cases `serve/test_gpu_lease.py` pins. It
 has not been measured on real hardware yet: how long saving, unloading and loading take on your PC is unknown.
 
+## Installing this fork's server on Windows
+
+The release's Terminal does not have the lease. This fork's installer puts the changed server files into a copy of the official
+v0.2.9 Terminal (Control 0.1.55, built from commit `c62d5e3a`, the commit these changes start from):
+
+```powershell
+strata launch --stop
+irm https://raw.githubusercontent.com/shuai532209720/Strata/main/packaging/install-gpulease.ps1 | iex
+```
+
+- It uses the official Terminal already installed, or installs it first with the official v0.2.9 installer (its signed feed and checksum).
+- It downloads `serve/server.py`, `serve/images.py`, `serve/gpu_lease.py` and the lease test from commit `040afb0e` of this fork,
+  checks each SHA-256 against the value in the script, copies the official Terminal to `terminal\0.1.55-gpulease-040afb0e`, puts them
+  in, checks that it starts, and points `terminal\current` at it.
+- Models, engines, presets and run configs live outside the Terminal folder: nothing is downloaded again.
+- Back to the official Terminal: `$env:STRATA_GPULEASE_ROLLBACK='1'`, then the same `irm ... | iex`.
+- `strata update` to a later release replaces it; the lease then needs a new installer for that release.
+- From a file instead (no internet on that PC): `packaging/patch_release_terminal.py` builds the archive, `packaging/install-local.ps1`
+  installs it.
+
+Not run on a Windows PC yet: the script was only parsed with PowerShell 7 and its downloads checked.
+
 ## Turning it on
 
 Add one key to the model's run config (`strata-<model>.json`) and restart:
