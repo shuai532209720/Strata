@@ -406,25 +406,36 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
 
 def _make_room(svc, gen: ImageGen, policy: str, need: int):
     """Do what `policy` says before the job; -> what _give_back needs."""
+    return make_room(svc, policy, need, gen.dir, gen._say, "image job")
+
+
+def make_room(svc, policy: str, need: int | None, save_dir, say, who: str = "image job", info: dict | None = None):
+    """The text engine gives the GPU to another job (an image job here, a GPU lease in serve/gpu_lease.py); the caller
+    holds the service's turn.  shrink: the expert cache keeps `need` MiB of VRAM free (as POST /v1/vram); unload: the
+    conversation is saved to a session file in `save_dir`, then the engine and the vision encoder stop.  -> what
+    give_back needs ("shrunk", the session file, "unloaded" or None).  `info`, when given, gets the saved session's
+    "tokens", "bytes" and "ms"."""
     eng = svc.engine
     if policy == "shrink":
         try:
             out = eng.vram(need)
-            gen._say(f"image job: the engine's expert cache gave VRAM back ({out.get('vram_free_mib')} MiB free)")
+            say(f"{who}: the engine's expert cache gave VRAM back ({out.get('vram_free_mib')} MiB free)")
             return "shrunk"
         except Exception as e:                       # noqa: BLE001 - the job still runs, with what is free
-            gen._say(f"image job: the engine could not give VRAM back ({e}); the job runs with what is free")
+            say(f"{who}: the engine could not give VRAM back ({e}); the job runs with what is free")
             return None
     if policy == "unload":
         saved = None
         if hasattr(eng, "session_file") and not getattr(eng, "batch", 0):
-            path = str(gen.dir / f"llm-session-{secrets.token_hex(6)}.bin")
+            path = str(Path(save_dir) / f"llm-session-{secrets.token_hex(6)}.bin")
             try:
                 r = eng.session_file("save", path)
                 saved = path
-                gen._say(f"image job: the conversation ({r.get('tokens')} tokens) saved; unloading the model")
+                if info is not None:
+                    info.update(tokens=r.get("tokens"), bytes=r.get("bytes"), ms=r.get("ms"))
+                say(f"{who}: the conversation ({r.get('tokens')} tokens) saved; unloading the model")
             except Exception as e:                   # noqa: BLE001 - unloading still frees the GPU
-                gen._say(f"image job: the conversation could not be saved ({e}); unloading the model")
+                say(f"{who}: the conversation could not be saved ({e}); unloading the model")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
         eng.unload()
@@ -435,20 +446,27 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
 
 
 def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
+    give_back(svc, policy, restore, gen.reload, gen._say, "image job")
+
+
+def give_back(svc, policy: str, restore, reload: str, say, who: str = "image job") -> None:
+    """After the other job (the caller still holds the service's turn): the expert cache grows back, or the next
+    engine start restores the saved conversation - right away with reload "eager", else with the next request."""
     eng = svc.engine
     if restore == "shrunk":
         try:
             eng.vram(svc.vram_reserve)               # the reserve asked for last (None: the start's)
         except Exception as e:                       # noqa: BLE001
-            gen._say(f"image job: the expert cache did not grow back ({e}); POST /v1/vram can retry")
+            say(f"{who}: the expert cache did not grow back ({e}); POST /v1/vram can retry")
     elif policy == "unload" and restore:
         if restore != "unloaded":
             svc.restore_after_load = restore         # Service.ensure_loaded restores it after the next start
-        if gen.reload == "eager":
+            svc.restore_after_load_by = who
+        if reload == "eager":
             try:
                 svc.ensure_loaded()                  # the caller still holds the FIFO
             except Exception as e:                   # noqa: BLE001 - the next request tries again
-                gen._say(f"image job: the model did not load again yet ({e}); the next request loads it")
+                say(f"{who}: the model did not load again yet ({e}); the next request loads it")
 
 
 def restore_session(svc) -> None:
@@ -457,11 +475,12 @@ def restore_session(svc) -> None:
     if not path:
         return
     svc.restore_after_load = None
+    who = getattr(svc, "restore_after_load_by", None) or "image job"
     try:
         r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
+        print(f"[strata] the conversation from before the {who} is back ({r.get('tokens')} tokens)", flush=True)
     except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
-        print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
+        print(f"[strata] the conversation from before the {who} was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:
         with contextlib.suppress(OSError):

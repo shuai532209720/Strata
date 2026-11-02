@@ -361,6 +361,11 @@ API without the engine or the vision encoder. The first generation request or `P
 `application/json` and no foreign browser Origin, and return **409** while a request is active or queued). `/api/health`
 aliases `/health`, and `/v1/status` exposes `loaded` and `auto_load`.
 
+**Lending the whole GPU and the RAM to another program for a while** (opt-in, `"gpu_lease": true`,
+[GPU_LEASE.md](GPU_LEASE.md)). A program on this PC (ComfyUI) asks with `POST /v1/gpu/lease`; Strata saves the
+conversation, stops the engine and keeps chat requests waiting until the program gives the GPU back or its lease
+runs out.
+
 **Giving part of the VRAM back while it keeps serving** (opt-in, one NVIDIA GPU, [VRAM_ELASTIC.md](VRAM_ELASTIC.md)). With
 `"vram_elastic": true` (engine flag `--vram-elastic`) the expert cache is allocated in 512 MiB segments
 (`"vram_segment_mib"`). `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much VRAM is free;

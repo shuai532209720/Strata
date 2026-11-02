@@ -13,6 +13,7 @@
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |
 | Check privacy, downloads and network access | [Safety and privacy](SAFETY.md) |
+| Let ComfyUI or another program use the GPU in turns (opt-in) | [GPU lease](GPU_LEASE.md) |
 
 ## Hardware
 

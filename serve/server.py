@@ -86,6 +86,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import gpu_lease as lease_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -4273,6 +4274,8 @@ class Service:
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
+        self.gpu_lease = None                             # serve/gpu_lease.py's LeaseManager ("gpu_lease": true)
+        self.gpu_lease_off = ""                           # why "gpu_lease": true stayed off (GET /v1/gpu/lease says)
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
@@ -4533,6 +4536,13 @@ class Service:
         started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
 
+    def _lease_vision_ready(self):
+        """With a GPU lease (opt-in) a request does not start the engine and its encoder before its prompt is
+        prepared (load() leaves that to run()), so a picture's encode can come after a lease left them stopped: start
+        them in this turn (the caller holds self.fifo).  Without a lease nothing changes."""
+        if self.gpu_lease is not None and (self._vision_down() or not self.loaded()):
+            self.ensure_loaded()
+
     def _vision_up(self):
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
@@ -4752,6 +4762,11 @@ class Service:
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
+            return
+        lease = self.gpu_lease
+        if lease is not None and lease.active():
+            # another program holds the GPU (serve/gpu_lease.py): the request waits for its turn in run(), which sends
+            # keep-alives meanwhile and starts the engine when the turn comes; waiting here would send nothing at all
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -5004,11 +5019,14 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+        out = {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+               "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+               "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+               "hardware_static":
+               tel["static"], "history": tel["history"], "time": now}
+        if self.gpu_lease is not None:                  # opt-in: only a server with "gpu_lease" on says anything
+            out["gpu_lease"] = self.gpu_lease.view()
+        return out
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -5066,7 +5084,7 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
-        return {
+        out = {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
@@ -5094,6 +5112,9 @@ class Service:
                         "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")} if static.get("gpu_name") else None,
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+        if self.gpu_lease is not None:                  # opt-in: only a server with "gpu_lease" on says anything
+            out["gpu_lease"] = self.gpu_lease.view()
+        return out
 
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
@@ -5169,6 +5190,7 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                            self._lease_vision_ready()
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
@@ -5247,6 +5269,7 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
+                self._lease_vision_ready()
                 self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
@@ -5600,6 +5623,13 @@ class Service:
                     left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
                     if left <= 0:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    lease = self.gpu_lease
+                    if lease is not None and lease.pending():
+                        # a GPU lease waits for the turn: it goes first (the FIFO lock is not fair, and requests
+                        # that keep coming would starve it); this request keeps its place behind it
+                        if not lease.wait_not_pending(min(QUEUE_BEAT_S, left)):
+                            yield "ping", None
+                        continue
                     got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
                     if got:
                         if cancel.is_set():
@@ -7403,6 +7433,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/gpu/lease":
+                if self._authorized() and self._lease_gate(post=False):
+                    self._json(200, svc.gpu_lease.view())
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -7433,6 +7466,17 @@ def make_handler(svc: Service):
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
                 return
+            if path == "/v1/gpu/lease" or path.startswith("/v1/gpu/lease/"):   # opt-in (serve/gpu_lease.py)
+                self._lease_post(path)
+                return
+            if svc.gpu_lease is not None and svc.gpu_lease.active() and (
+                    path in ("/unload", "/load", "/v1/unload", "/v1/load", "/v1/vram") or path.startswith("/slots/")):
+                if path in ("/unload", "/load") and not self.body_read:
+                    self._control_body()
+                self._json(409, {"error": {"type": "model_busy", "code": "gpu_leased",
+                                           "message": "another program holds the GPU (a GPU lease); try again "
+                                                      "when it has given it back"}})
+                return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
@@ -7453,6 +7497,14 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             reserved = False
+            if svc.gpu_lease is not None and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                wait = svc.gpu_lease.rejecting()            # "gpu_lease_queue": "reject" (the default queues)
+                if wait is not None:
+                    error = {"type": "server_error", "code": "gpu_leased",
+                             "message": "another program holds the GPU (a GPU lease); try again later"}
+                    self._json(503, responses_error_body(error["message"], "server_error", code="gpu_leased")
+                               if path == "/v1/responses" else {"error": error}, retry_after=int(wait))
+                    return
             try:
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     reserved = svc.reserve_inference()
@@ -7688,6 +7740,71 @@ def make_handler(svc: Service):
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
+
+        def _lease_gate(self, post: bool = True) -> bool:
+            """The GPU lease's own checks after the API key (docs/GPU_LEASE.md): on at all, JSON from no foreign page
+            (a POST, whose body the caller has read), a connection from this PC and no proxy's header
+            (gpu_lease_loopback_only), the lease key.  False: answered."""
+            mgr = svc.gpu_lease
+            if mgr is None:
+                why = svc.gpu_lease_off or 'the GPU lease is off (add "gpu_lease": true to the run config)'
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "gpu_lease_disabled",
+                                           "message": why}})
+                return False
+            if post and not self._own_page("the GPU lease can be used"):
+                return False
+            if mgr.loopback_only:
+                peer = self.client_address[0] if self.client_address else ""
+                proxy = lease_api.forwarded(self.headers)
+                if not lease_api.loopback_peer(peer) or proxy:
+                    print(f"[strata] refused a GPU lease request from {peer}"
+                          f"{f' (through a proxy: {proxy})' if proxy else ''}: only programs on this PC may use it",
+                          flush=True)
+                    self._json(403, {"error": {"type": "forbidden", "code": "gpu_lease_forbidden",
+                                               "message": "the GPU lease takes requests from programs on this PC only"
+                                                          + (" (this one came through a proxy or tunnel)" if proxy
+                                                             else "")}})
+                    return False
+            if mgr.key is not None and not lease_api.key_matches(self.headers.get(lease_api.KEY_HEADER, ""), mgr.key):
+                self._json(403, {"error": {"type": "forbidden", "code": "gpu_lease_forbidden",
+                                           "message": f"missing or wrong lease key ({lease_api.KEY_HEADER})"}})
+                return False
+            return True
+
+        def _lease_post(self, path):
+            """POST /v1/gpu/lease, /v1/gpu/lease/<id>/renew and /release (serve/gpu_lease.py)."""
+            raw = self._body() or b"{}"                  # read first: an answer before the body resets the socket on Windows
+            if not self._lease_gate():
+                return
+            mgr = svc.gpu_lease
+            try:
+                req = json.loads(raw)
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+                parts = path.split("/")                  # "", "v1", "gpu", "lease"[, id, action]
+                if len(parts) == 4:
+                    cancel = threading.Event()
+                    self._watch_client(cancel)           # a client that leaves before the answer does not hold it
+                    try:
+                        out = mgr.acquire(req, cancel)
+                    finally:
+                        if self.watch_done is not None:
+                            self.watch_done.set()
+                        with svc.status_lock:
+                            svc.active_cancels.discard(cancel)
+                    self._json(200, out)
+                elif len(parts) == 6 and parts[5] == "renew":
+                    self._json(200, mgr.renew(parts[4], req))
+                elif len(parts) == 6 and parts[5] == "release":
+                    self._json(200, mgr.release(parts[4], req))
+                else:
+                    self._json(404, {"error": {"message": "not found"}})
+            except lease_api.LeaseError as e:
+                if e.status == 499:                      # the client left: nothing to answer
+                    return
+                self._json(e.status, e.body(), retry_after=int(e.retry_after) if e.retry_after else None)
+            except ValueError as e:                       # json.JSONDecodeError included
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -9414,6 +9531,20 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # opt-in (docs/GPU_LEASE.md): another program on this PC (ComfyUI) borrows the GPU and the RAM for a while
+    lease_mgr, lease_off = lease_api.from_config(
+        svc, cfg, a.host, os.environ, os.path.dirname(os.path.abspath(a.config)) if a.config else None)
+    if lease_mgr is not None:
+        svc.gpu_lease = lease_mgr
+        par_slots = int(getattr(svc.engine, "batch", 0) or 0)
+        print(f"[strata] GPU lease on: POST /v1/gpu/lease ({lease_mgr.queue_mode} queue, "
+              f"{lease_mgr.ttl_s:g} s renewable, {'lease key from ' + lease_mgr.key_source if lease_mgr.key else 'no lease key'}"
+              f"{', this PC only' if lease_mgr.loopback_only else ''})"
+              + (f' - WARNING: "parallel" is {par_slots}, and a lease needs one request at a time: every request for '
+                 "one is refused" if par_slots else ""), flush=True)
+    elif lease_off:
+        svc.gpu_lease_off = "the GPU lease is off: " + lease_off
+        print(f"[strata] WARNING: {svc.gpu_lease_off}", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -9543,6 +9674,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
     finally:
         cancelled = 0
+        if svc.gpu_lease is not None:                   # a lease ends now; the engine is not started again
+            svc.gpu_lease.shutdown()
         if a.shutdown_timeout is not None:
             pending = svc.begin_drain()
             notify_lifecycle("draining", {"instance_id": svc.instance_id,
