@@ -126,7 +126,7 @@ irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | ie
 **Windows PowerShell，本 fork（带 GPU 租约：和本机 ComfyUI 分时使用显卡和内存）**
 
 ```powershell
-irm https://github.com/shuai532209720/Strata/releases/download/gpulease/install.ps1 | iex
+irm https://github.com/shuai532209720/Strata/releases/latest/download/install.ps1 | iex
 ```
 
 它以官方 v0.2.9 的 Terminal 为底（已装好就直接用，没有就先用官方安装程序装上），只换进本 fork 改过的服务端文件（逐个校验 SHA-256），

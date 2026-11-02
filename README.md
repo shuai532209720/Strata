@@ -130,7 +130,7 @@ irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | ie
 **Windows PowerShell, this fork (with the GPU lease: take turns on the card and the RAM with a local ComfyUI)**
 
 ```powershell
-irm https://github.com/shuai532209720/Strata/releases/download/gpulease/install.ps1 | iex
+irm https://github.com/shuai532209720/Strata/releases/latest/download/install.ps1 | iex
 ```
 
 It starts from the official v0.2.9 Terminal (the one installed, or the official installer of v0.2.9 when there is none) and puts in

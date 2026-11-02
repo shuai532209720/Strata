@@ -28,7 +28,7 @@ v0.2.9 Terminal (Control 0.1.55, built from commit `c62d5e3a`, the commit these 
 
 ```powershell
 strata launch --stop
-irm https://github.com/shuai532209720/Strata/releases/download/gpulease/install.ps1 | iex
+irm https://github.com/shuai532209720/Strata/releases/latest/download/install.ps1 | iex
 ```
 
 - It uses the official Terminal already installed, or installs it first with the official v0.2.9 installer (its signed feed and checksum).
