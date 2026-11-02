@@ -153,7 +153,8 @@ when the lease is on.
 | --- | --- |
 | A chat request (streamed) | Waits in the queue with a keep-alive every 10 s, then runs |
 | A chat request (not streamed) | Waits too, but receives nothing until it runs: its client's own timeout decides how long it waits |
-| A chat request with a picture | Waits before its answer starts, with no keep-alive |
+| A chat request with pictures encoded before (an agent resends its history's pictures every turn) | As one without pictures: the encoded pictures come from the cache, without waiting |
+| A chat request with a new picture (streamed) | The stream starts at once with keep-alives; the picture is encoded when the lease has ended. An error after that (a picture that cannot be read) is the stream's last event, not an HTTP status |
 | A new lease | Waits for this one, up to its `wait_s` |
 | `/unload`, `/load`, `/v1/load`, `/v1/unload`, `/v1/vram`, `/slots/...` | 409 `gpu_leased` |
 | `/v1/images/generations` | Waits its turn |

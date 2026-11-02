@@ -3006,6 +3006,21 @@ class Vision:
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
+    def cached(self, source: str | bytes) -> tuple[Path, int] | None:
+        """encode()'s answer when the picture is already encoded (its embeddings file still there), else None.  It
+        needs neither the encoder process nor the GPU, so a GPU lease does not hold it up."""
+        try:
+            data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        except Exception:  # noqa: BLE001 - a picture that cannot be read goes the normal way (and gets its error there)
+            return None
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit is None or not Path(hit[0]).exists():
+                return None
+            self.cache[key] = self.cache.pop(key)                      # most recently used last
+            return hit
+
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
@@ -4276,6 +4291,7 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.gpu_lease = None                             # serve/gpu_lease.py's LeaseManager ("gpu_lease": true)
         self.gpu_lease_off = ""                           # why "gpu_lease": true stayed off (GET /v1/gpu/lease says)
+        self.early_stream = threading.local()             # with a lease: this request's EarlyStream (see _turn)
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
@@ -4535,6 +4551,16 @@ class Service:
         reserve, or 0 when none was asked (the cache grows back to its full size; None would leave the reserve the engine
         started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
+
+    def _lease_cached(self, images) -> list | None:
+        """While a GPU lease is active: every picture's encode() answer when all of them are encoded already (an
+        agent resends its history's pictures with every turn), so the request does not wait for the turn the lease
+        holds just to read the cache.  None otherwise, and always without a lease."""
+        lease = self.gpu_lease
+        if lease is None or not lease.active() or self.vision is None or not hasattr(self.vision, "cached"):
+            return None
+        hits = [self.vision.cached(src) for src in images]
+        return hits if all(h is not None for h in hits) else None
 
     def _lease_vision_ready(self):
         """With a GPU lease (opt-in) a request does not start the engine and its encoder before its prompt is
@@ -5157,9 +5183,19 @@ class Service:
         if cancel is None:
             self.fifo.acquire()
         else:
+            # a GPU lease (opt-in) can hold the turn for many minutes: a streamed request starts its stream here and
+            # sends keep-alives while it waits, as a queued generation does; without a lease nothing changes
+            hook = getattr(self.early_stream, "hook", None) if self.gpu_lease is not None else None
+            beat_at = 0.0
             while not self.fifo.acquire(timeout=0.25):
                 if cancel.is_set():
                     raise ClientGone()
+                if hook is not None and self.gpu_lease.active():
+                    now = time.monotonic()
+                    if not hook.started or now - beat_at >= QUEUE_BEAT_S:
+                        if not hook.beat():
+                            raise ClientGone()
+                        beat_at = now
         try:
             yield
         finally:
@@ -5189,6 +5225,8 @@ class Service:
                             raise ValueError("offline mode cannot download an image URL")
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
+                        if self._lease_cached([src]) is not None:
+                            continue              # already encoded: nothing for the encoder (a GPU lease holds the turn)
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self._lease_vision_ready()
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
@@ -5268,14 +5306,18 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self._turn(cancel):
-                self._lease_vision_ready()
-                self._vision_up()
-                try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
-                finally:
-                    self.last_image_at = time.time()
+            encoded = self._lease_cached(images)
+            if encoded is not None:                      # all encoded before: no encoder, no turn (a GPU lease holds it)
+                self.last_image_at = time.time()
+            else:
+                with self._turn(cancel):
+                    self._lease_vision_ready()
+                    self._vision_up()
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self.last_image_at = time.time()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -6781,6 +6823,27 @@ class BadBody(Exception):
         self.status = status
 
 
+class EarlyStream:
+    """A streamed request that must wait for the service's turn before its prompt is ready (a picture to encode while
+    a GPU lease holds the turn): the first beat sends the event-stream headers, every beat a keep-alive comment, so
+    the client's idle timeout does not end it.  beat() -> False when the client has gone."""
+
+    def __init__(self, handler):
+        self.handler, self.started = handler, False
+
+    def beat(self) -> bool:
+        h = self.handler
+        try:
+            if not self.started:
+                h._sse()
+                h.early_sse = self.started = True
+            h.wfile.write(b": keep-alive\n\n")
+            h.wfile.flush()
+            return True
+        except OSError:
+            return False
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -6789,6 +6852,8 @@ def make_handler(svc: Service):
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         cancel_event = None                                 # active generation owned by this handler
         body_read = False                                   # whether a handler took this request's body
+        sse_started = False                                 # the event-stream headers are sent (_sse)
+        early_sse = False                                   # ... by EarlyStream, before the request was prepared
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
@@ -7013,6 +7078,8 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None, retry_after=None):
+            if self.early_sse:                              # the stream is open: the answer goes in as its error event
+                return self._stream_error(code, obj)
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -7568,6 +7635,8 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                    if svc.gpu_lease is not None and req.get("stream") is True:
+                        svc.early_stream.hook = EarlyStream(self)   # opt-in: see Service._turn
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -7638,6 +7707,8 @@ def make_handler(svc: Service):
             finally:
                 if reserved:
                     svc.release_inference()
+                if svc.gpu_lease is not None:
+                    svc.early_stream.hook = None
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -7740,6 +7811,28 @@ def make_handler(svc: Service):
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
+
+        def _stream_error(self, code, obj):
+            """An error after EarlyStream opened the stream (a GPU lease, opt-in): the status line is gone, so the
+            error is the stream's last event, in the API's own form, as an error after the answer started already is."""
+            err = obj.get("error") if isinstance(obj, dict) and isinstance(obj.get("error"), dict) else \
+                {"message": str(obj)}
+            self._note(http_status=code, error=err)
+            path = V1_V1_ALIASES.get(self.path.split("?")[0].rstrip("/"), self.path.split("?")[0].rstrip("/"))
+            try:
+                if path == "/v1/messages":
+                    body = {"type": "error", "error": {"type": err.get("type") or "api_error",
+                                                       "message": err.get("message", "")}}
+                    self.wfile.write(b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n")
+                elif path == "/v1/responses":
+                    body = {"type": "error", "code": err.get("code") or err.get("type") or "server_error",
+                            "message": err.get("message", "")}
+                    self.wfile.write(b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n")
+                else:
+                    self.wfile.write(b"data: " + json.dumps({"error": err}).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
 
         def _lease_gate(self, post: bool = True) -> bool:
             """The GPU lease's own checks after the API key (docs/GPU_LEASE.md): on at all, JSON from no foreign page
@@ -7897,6 +7990,9 @@ def make_handler(svc: Service):
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
+            if self.sse_started:                            # EarlyStream sent them already (a GPU lease, opt-in)
+                return
+            self.sse_started = True
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

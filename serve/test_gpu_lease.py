@@ -434,7 +434,183 @@ class Access(Base):
             self.assertEqual(lease_api.loopback_peer(ip), ok, ip)
 
 
-class Config(unittest.TestCase):                                               # T20
+class Pictures(Base):
+    """A request with pictures while a lease is held: pictures encoded before need no turn; a new picture waits for
+    the turn with the stream open and keep-alives; an error after that arrives as the stream's error event."""
+
+    class FakeVision:
+        elastic = False
+
+        def __init__(self, d):
+            self.dir = Path(d)
+            self.cache, self.encodes, self.running, self.restarts, self.fail = {}, 0, True, 0, None
+
+        def alive(self):
+            return self.running
+
+        def unload(self):
+            self.running = False
+
+        def restart(self):
+            self.running, self.restarts = True, self.restarts + 1
+
+        def cached(self, src):
+            hit = self.cache.get(src)
+            return hit if hit is not None and hit[0].exists() else None
+
+        def encode(self, src, keep=()):
+            if self.fail:
+                raise ValueError(self.fail)
+            if not self.running:
+                raise ValueError("the picture reader is not running")
+            if src not in self.cache:
+                self.encodes += 1
+                p = self.dir / f"pic{self.encodes}.sve"
+                p.write_bytes(b"rows")
+                self.cache[src] = (p, 3)
+            return self.cache[src]
+
+        def encode_all(self, sources, cancel=None):
+            return [self.encode(s) for s in sources]
+
+    def setUp(self):
+        super().setUp()
+        self.vision = self.FakeVision(tempfile.mkdtemp())
+        self.svc.vision = self.vision
+        self.lease_on()
+
+    @staticmethod
+    def chat(src, stream=True):
+        return {**CHAT, "stream": stream, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": src}}]}]}
+
+    def open_stream(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=10)
+
+    def beats(self, resp, n=2):
+        got = 0
+        while got < n:
+            if resp.readline().startswith(b": keep-alive"):
+                got += 1
+
+    def held_lease(self):
+        return self.acquire()[1]["lease_id"]
+
+    def test_a_picture_encoded_before_does_not_wait_for_the_turn(self):
+        self.assertEqual(self.request("/v1/chat/completions", self.chat("a.png", stream=False))[0], 200)
+        self.assertEqual(self.vision.encodes, 1)
+        lid = self.held_lease()
+        self.assertFalse(self.vision.running)                      # the lease stopped the encoder too
+        with mock.patch.object(server_mod, "QUEUE_BEAT_S", 0.2):
+            resp = self.open_stream("/v1/chat/completions", self.chat("a.png"))
+            self.assertIn("event-stream", resp.headers.get("Content-Type"))
+            self.beats(resp)
+            self.request(f"/v1/gpu/lease/{lid}/release", {})
+            rest = resp.read().decode()
+            resp.close()
+        self.assertIn("data: [DONE]", rest)
+        self.assertNotIn('"error"', rest)
+        self.assertEqual(self.vision.encodes, 1)                   # read from the cache, not encoded again
+
+    def test_a_new_picture_opens_the_stream_and_waits_with_keep_alives(self):
+        lid = self.held_lease()
+        with mock.patch.object(server_mod, "QUEUE_BEAT_S", 0.2):
+            resp = self.open_stream("/v1/chat/completions", self.chat("b.png"))
+            self.assertIn("event-stream", resp.headers.get("Content-Type"))
+            self.beats(resp, 3)
+            self.assertEqual(self.vision.encodes, 0)               # still waiting: nothing encoded during the lease
+            self.request(f"/v1/gpu/lease/{lid}/release", {})
+            rest = resp.read().decode()
+            resp.close()
+        self.assertIn('"content": "H"', rest)
+        self.assertIn("data: [DONE]", rest)
+        self.assertEqual(self.vision.encodes, 1)
+        self.assertGreaterEqual(self.vision.restarts, 1)           # the encoder came back with the engine
+        self.assertTrue(self.engine.loaded)
+
+    def test_the_anthropic_stream_too(self):
+        lid = self.held_lease()
+        body = {"max_tokens": 16, "stream": True, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]}
+        with mock.patch.object(server_mod, "QUEUE_BEAT_S", 0.2):
+            resp = self.open_stream("/v1/messages", body)
+            self.assertIn("event-stream", resp.headers.get("Content-Type"))
+            self.beats(resp)
+            self.request(f"/v1/gpu/lease/{lid}/release", {})
+            rest = resp.read().decode()
+            resp.close()
+        self.assertIn("event: message_stop", rest)
+        self.assertNotIn("event: error", rest)
+
+    def test_an_error_after_the_stream_opened_is_its_last_event(self):
+        lid = self.held_lease()
+        self.vision.fail = "the image could not be read: bad bytes"
+        with mock.patch.object(server_mod, "QUEUE_BEAT_S", 0.2):
+            resp = self.open_stream("/v1/chat/completions", self.chat("c.png"))
+            self.beats(resp)
+            self.request(f"/v1/gpu/lease/{lid}/release", {})
+            rest = resp.read().decode()
+            resp.close()
+        self.assertEqual(resp.status, 200)
+        events = [json.loads(line[6:]) for line in rest.splitlines() if line.startswith("data: {")]
+        self.assertEqual(len(events), 1)
+        self.assertIn("bad bytes", events[0]["error"]["message"])
+        self.assertTrue(rest.rstrip().endswith("data: [DONE]"))
+
+    def test_a_non_streamed_picture_request_still_completes(self):
+        self.assertEqual(self.request("/v1/chat/completions", self.chat("a.png", stream=False))[0], 200)
+        lid = self.held_lease()
+        t, out = self.in_thread(self.request, "/v1/chat/completions", self.chat("a.png", stream=False))
+        time.sleep(0.5)
+        self.assertTrue(t.is_alive())                               # waits (no bytes: not streamed)
+        self.request(f"/v1/gpu/lease/{lid}/release", {})
+        t.join(15)
+        self.assertEqual(out["result"][0], 200)
+
+    def test_a_tool_picture_encoded_before_needs_no_turn(self):
+        self.vision.encode("t.png")
+        lid = self.held_lease()
+        msgs = [{"role": "tool", "tool_call_id": "1", "content": [{"type": "image", "source": "t.png"}]}]
+        t, out = self.in_thread(self.svc._note_unreadable_tool_images, msgs, threading.Event())
+        t.join(2)
+        self.assertFalse(t.is_alive())                              # the cache answered; the lease holds the turn
+        self.assertEqual(msgs[0]["content"][0]["type"], "image")
+        new = [{"role": "tool", "tool_call_id": "2", "content": [{"type": "image", "source": "n.png"}]}]
+        t2, _ = self.in_thread(self.svc._note_unreadable_tool_images, new, threading.Event())
+        time.sleep(0.5)
+        self.assertTrue(t2.is_alive())                              # a new one waits for the turn
+        self.request(f"/v1/gpu/lease/{lid}/release", {})
+        t2.join(10)
+        self.assertEqual(new[0]["content"][0]["type"], "image")
+        self.assertEqual(self.vision.encodes, 2)
+
+
+class VisionCache(unittest.TestCase):
+    def test_cached_answers_only_for_a_picture_encoded_before(self):
+        import io as _io
+        from PIL import Image
+        from serve.server import Vision
+        d = Path(tempfile.mkdtemp())
+        v = Vision.__new__(Vision)                                  # no encoder process: cached() needs none
+        v.lock, v.cache, v.dir = threading.Lock(), {}, d
+        buf = _io.BytesIO()
+        Image.new("RGB", (8, 8), (200, 10, 10)).save(buf, "PNG")
+        png = buf.getvalue()
+        self.assertIsNone(v.cached(png))
+        import hashlib
+        key = hashlib.sha256(v.normalize(png)).hexdigest()[:32]
+        f = d / f"{key}.sve"
+        v.cache[key] = (f, 5)
+        self.assertIsNone(v.cached(png))                           # its file is gone: encode it again
+        f.write_bytes(b"rows")
+        self.assertEqual(v.cached(png), (f, 5))
+        self.assertIsNone(v.cached(b"not a picture"))               # unreadable: the normal path reports it
+
+
+class ConfigRules(unittest.TestCase):                                          # T20
     class Svc:
         api_key = ""
 
